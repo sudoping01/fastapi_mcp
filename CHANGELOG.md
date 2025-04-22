@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2]
+
+### Fixed
+- 🐛 Fix a bug preventing simple setup of [basic token passthrough](docs/03_authentication_and_authorization.md#basic-token-passthrough)
+
+## [0.3.1]
+
+🚀 FastApiMCP now supports MCP Authorization!
+
+You can now add MCP-compliant OAuth configuration in a FastAPI-native way, using your existing FastAPI `Depends()` that we all know and love.
+
+### Added
+- 🎉 Support for Authentication / Authorization compliant to [MCP 2025-03-26 Specification](https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization), using OAuth 2.1. (#10)
+- 🎉 Support passing http headers to tool calls (#82)
+
+## [0.3.0]
+
+🚀 FastApiMCP now works with ASGI-transport by default.
+
+This means the `base_url` argument is redundant, and thus has been removed.
+
+You can still set up an explicit base URL using the `http_client` argument, and injecting your own `httpx.AsyncClient` if necessary.
+
+### Removed
+- ⚠️ Breaking Change: Removed `base_url` argument since it's not used anymore by the MCP transport.
+
+### Fixed
+- 🐛 Fix short timeout issue (#71), increasing the default timeout to 10
+
+
 ## [0.2.0]
 
 ### Changed

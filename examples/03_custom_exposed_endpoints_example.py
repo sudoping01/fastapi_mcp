@@ -1,54 +1,52 @@
-from examples.shared.apps import items
+"""
+This example shows how to customize exposing endpoints by filtering operation IDs and tags.
+Notes on filtering:
+- You cannot use both `include_operations` and `exclude_operations` at the same time
+- You cannot use both `include_tags` and `exclude_tags` at the same time
+- You can combine operation filtering with tag filtering (e.g., use `include_operations` with `include_tags`)
+- When combining filters, a greedy approach will be taken. Endpoints matching either criteria will be included
+"""
+from examples.shared.apps.items import app # The FastAPI app
 from examples.shared.setup import setup_logging
 
 from fastapi_mcp import FastApiMCP
 
 setup_logging()
 
-# Example demonstrating how to filter MCP tools by operation IDs and tags
+# Examples demonstrating how to filter MCP tools by operation IDs and tags
 
 # Filter by including specific operation IDs
 include_operations_mcp = FastApiMCP(
-    items.app,
+    app,
     name="Item API MCP - Included Operations",
-    description="MCP server showing only specific operations",
-    base_url="http://localhost:8000",
     include_operations=["get_item", "list_items"],
 )
 
 # Filter by excluding specific operation IDs
 exclude_operations_mcp = FastApiMCP(
-    items.app,
+    app,    
     name="Item API MCP - Excluded Operations",
-    description="MCP server showing all operations except the excluded ones",
-    base_url="http://localhost:8000",
     exclude_operations=["create_item", "update_item", "delete_item"],
 )
 
 # Filter by including specific tags
 include_tags_mcp = FastApiMCP(
-    items.app,
+    app,
     name="Item API MCP - Included Tags",
-    description="MCP server showing operations with specific tags",
-    base_url="http://localhost:8000",
     include_tags=["items"],
 )
 
 # Filter by excluding specific tags
 exclude_tags_mcp = FastApiMCP(
-    items.app,
+    app,
     name="Item API MCP - Excluded Tags",
-    description="MCP server showing operations except those with specific tags",
-    base_url="http://localhost:8000",
     exclude_tags=["search"],
 )
 
 # Combine operation IDs and tags (include mode)
 combined_include_mcp = FastApiMCP(
-    items.app,
+    app,
     name="Item API MCP - Combined Include",
-    description="MCP server showing operations by combining include filters",
-    base_url="http://localhost:8000",
     include_operations=["delete_item"],
     include_tags=["search"],
 )
@@ -69,4 +67,4 @@ if __name__ == "__main__":
     print(" - /include-tags-mcp: Only operations with the 'items' tag")
     print(" - /exclude-tags-mcp: All operations except those with the 'search' tag")
     print(" - /combined-include-mcp: Operations with 'search' tag or delete_item operation")
-    uvicorn.run(items.app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

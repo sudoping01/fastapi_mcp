@@ -1,56 +1,119 @@
 import json
 import httpx
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union, Callable, Awaitable, Iterable, Literal, Sequence
+from typing_extensions import Annotated, Doc
 
-from fastapi import FastAPI, Request, APIRouter
+from fastapi import FastAPI, Request, APIRouter, params
 from fastapi.openapi.utils import get_openapi
 from mcp.server.lowlevel.server import Server
 import mcp.types as types
 
 from fastapi_mcp.openapi.convert import convert_openapi_to_mcp_tools
 from fastapi_mcp.transport.sse import FastApiSseTransport
-from fastapi_mcp.types import AsyncClientProtocol
+from fastapi_mcp.types import HTTPRequestInfo, AuthConfig
 
-from logging import getLogger
+import logging
 
 
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+
+class LowlevelMCPServer(Server):
+    def call_tool(self):
+        """
+        A near-direct copy of `mcp.server.lowlevel.server.Server.call_tool()`, except that it looks for
+        the original HTTP request info in the MCP message, and passes it to the tool call handler.
+        """
+
+        def decorator(
+            func: Callable[
+                ...,
+                Awaitable[Iterable[types.TextContent | types.ImageContent | types.EmbeddedResource]],
+            ],
+        ):
+            logger.debug("Registering handler for CallToolRequest")
+
+            async def handler(req: types.CallToolRequest):
+                try:
+                    # Pull the original HTTP request info from the MCP message. It was injected in
+                    # `FastApiSseTransport.handle_fastapi_post_message()`
+                    if hasattr(req.params, "_http_request_info") and req.params._http_request_info is not None:
+                        http_request_info = HTTPRequestInfo.model_validate(req.params._http_request_info)
+                        results = await func(req.params.name, (req.params.arguments or {}), http_request_info)
+                    else:
+                        results = await func(req.params.name, (req.params.arguments or {}))
+                    return types.ServerResult(types.CallToolResult(content=list(results), isError=False))
+                except Exception as e:
+                    return types.ServerResult(
+                        types.CallToolResult(
+                            content=[types.TextContent(type="text", text=str(e))],
+                            isError=True,
+                        )
+                    )
+
+            self.request_handlers[types.CallToolRequest] = handler
+            return func
+
+        return decorator
 
 
 class FastApiMCP:
+    """
+    Create an MCP server from a FastAPI app.
+    """
+
     def __init__(
         self,
-        fastapi: FastAPI,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        base_url: Optional[str] = None,
-        describe_all_responses: bool = False,
-        describe_full_response_schema: bool = False,
-        http_client: Optional[AsyncClientProtocol] = None,
-        include_operations: Optional[List[str]] = None,
-        exclude_operations: Optional[List[str]] = None,
-        include_tags: Optional[List[str]] = None,
-        exclude_tags: Optional[List[str]] = None,
+        fastapi: Annotated[
+            FastAPI,
+            Doc("The FastAPI application to create an MCP server from"),
+        ],
+        name: Annotated[
+            Optional[str],
+            Doc("Name for the MCP server (defaults to app.title)"),
+        ] = None,
+        description: Annotated[
+            Optional[str],
+            Doc("Description for the MCP server (defaults to app.description)"),
+        ] = None,
+        describe_all_responses: Annotated[
+            bool,
+            Doc("Whether to include all possible response schemas in tool descriptions"),
+        ] = False,
+        describe_full_response_schema: Annotated[
+            bool,
+            Doc("Whether to include full json schema for responses in tool descriptions"),
+        ] = False,
+        http_client: Annotated[
+            Optional[httpx.AsyncClient],
+            Doc(
+                """
+                Optional custom HTTP client to use for API calls to the FastAPI app.
+                Has to be an instance of `httpx.AsyncClient`.
+                """
+            ),
+        ] = None,
+        include_operations: Annotated[
+            Optional[List[str]],
+            Doc("List of operation IDs to include as MCP tools. Cannot be used with exclude_operations."),
+        ] = None,
+        exclude_operations: Annotated[
+            Optional[List[str]],
+            Doc("List of operation IDs to exclude from MCP tools. Cannot be used with include_operations."),
+        ] = None,
+        include_tags: Annotated[
+            Optional[List[str]],
+            Doc("List of tags to include as MCP tools. Cannot be used with exclude_tags."),
+        ] = None,
+        exclude_tags: Annotated[
+            Optional[List[str]],
+            Doc("List of tags to exclude from MCP tools. Cannot be used with include_tags."),
+        ] = None,
+        auth_config: Annotated[
+            Optional[AuthConfig],
+            Doc("Configuration for MCP authentication"),
+        ] = None,
     ):
-        """
-        Create an MCP server from a FastAPI app.
-
-        Args:
-            fastapi: The FastAPI application
-            name: Name for the MCP server (defaults to app.title)
-            description: Description for the MCP server (defaults to app.description)
-            base_url: Base URL for API requests. If not provided, the base URL will be determined from the
-                FastAPI app's root path. Although optional, it is highly recommended to provide a base URL,
-                as the root path would be different when the app is deployed.
-            describe_all_responses: Whether to include all possible response schemas in tool descriptions
-            describe_full_response_schema: Whether to include full json schema for responses in tool descriptions
-            http_client: Optional HTTP client to use for API calls. If not provided, a new httpx.AsyncClient will be created.
-                This is primarily for testing purposes.
-            include_operations: List of operation IDs to include as MCP tools. Cannot be used with exclude_operations.
-            exclude_operations: List of operation IDs to exclude from MCP tools. Cannot be used with include_operations.
-            include_tags: List of tags to include as MCP tools. Cannot be used with exclude_tags.
-            exclude_tags: List of tags to exclude from MCP tools. Cannot be used with include_tags.
-        """
         # Validate operation and tag filtering options
         if include_operations is not None and exclude_operations is not None:
             raise ValueError("Cannot specify both include_operations and exclude_operations")
@@ -66,20 +129,27 @@ class FastApiMCP:
         self.name = name or self.fastapi.title or "FastAPI MCP"
         self.description = description or self.fastapi.description
 
-        self._base_url = base_url
+        self._base_url = "http://apiserver"
         self._describe_all_responses = describe_all_responses
         self._describe_full_response_schema = describe_full_response_schema
         self._include_operations = include_operations
         self._exclude_operations = exclude_operations
         self._include_tags = include_tags
         self._exclude_tags = exclude_tags
+        self._auth_config = auth_config
 
-        self._http_client = http_client or httpx.AsyncClient()
+        if self._auth_config:
+            self._auth_config = self._auth_config.model_validate(self._auth_config)
+
+        self._http_client = http_client or httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.fastapi, raise_app_exceptions=False),
+            base_url=self._base_url,
+            timeout=10.0,
+        )
 
         self.setup_server()
 
     def setup_server(self) -> None:
-        # Get OpenAPI schema from FastAPI app
         openapi_schema = get_openapi(
             title=self.fastapi.title,
             version=self.fastapi.version,
@@ -88,7 +158,6 @@ class FastApiMCP:
             routes=self.fastapi.routes,
         )
 
-        # Convert OpenAPI schema to MCP tools
         all_tools, self.operation_map = convert_openapi_to_mcp_tools(
             openapi_schema,
             describe_all_responses=self._describe_all_responses,
@@ -98,57 +167,156 @@ class FastApiMCP:
         # Filter tools based on operation IDs and tags
         self.tools = self._filter_tools(all_tools, openapi_schema)
 
-        # Determine base URL if not provided
-        if not self._base_url:
-            # Try to determine the base URL from FastAPI config
-            if hasattr(self.fastapi, "root_path") and self.fastapi.root_path:
-                self._base_url = self.fastapi.root_path
-            else:
-                # Default to localhost with FastAPI default port
-                port = 8000
-                for route in self.fastapi.routes:
-                    if hasattr(route, "app") and hasattr(route.app, "port"):
-                        port = route.app.port
-                        break
-                self._base_url = f"http://localhost:{port}"
+        mcp_server: LowlevelMCPServer = LowlevelMCPServer(self.name, self.description)
 
-        # Normalize base URL
-        if self._base_url.endswith("/"):
-            self._base_url = self._base_url[:-1]
-
-        # Create the MCP lowlevel server
-        mcp_server: Server = Server(self.name, self.description)
-
-        # Register handlers for tools
         @mcp_server.list_tools()
         async def handle_list_tools() -> List[types.Tool]:
             return self.tools
 
-        # Register the tool call handler
         @mcp_server.call_tool()
         async def handle_call_tool(
-            name: str, arguments: Dict[str, Any]
+            name: str, arguments: Dict[str, Any], http_request_info: Optional[HTTPRequestInfo] = None
         ) -> List[Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
             return await self._execute_api_tool(
                 client=self._http_client,
-                base_url=self._base_url or "",
                 tool_name=name,
                 arguments=arguments,
                 operation_map=self.operation_map,
+                http_request_info=http_request_info,
             )
 
         self.server = mcp_server
 
-    def mount(self, router: Optional[FastAPI | APIRouter] = None, mount_path: str = "/mcp") -> None:
+    def _register_mcp_connection_endpoint_sse(
+        self,
+        router: FastAPI | APIRouter,
+        transport: FastApiSseTransport,
+        mount_path: str,
+        dependencies: Optional[Sequence[params.Depends]],
+    ):
+        @router.get(mount_path, include_in_schema=False, operation_id="mcp_connection", dependencies=dependencies)
+        async def handle_mcp_connection(request: Request):
+            async with transport.connect_sse(request.scope, request.receive, request._send) as (reader, writer):
+                await self.server.run(
+                    reader,
+                    writer,
+                    self.server.create_initialization_options(notification_options=None, experimental_capabilities={}),
+                    raise_exceptions=False,
+                )
+
+    def _register_mcp_messages_endpoint_sse(
+        self,
+        router: FastAPI | APIRouter,
+        transport: FastApiSseTransport,
+        mount_path: str,
+        dependencies: Optional[Sequence[params.Depends]],
+    ):
+        @router.post(
+            f"{mount_path}/messages/",
+            include_in_schema=False,
+            operation_id="mcp_messages",
+            dependencies=dependencies,
+        )
+        async def handle_post_message(request: Request):
+            return await transport.handle_fastapi_post_message(request)
+
+    def _register_mcp_endpoints_sse(
+        self,
+        router: FastAPI | APIRouter,
+        transport: FastApiSseTransport,
+        mount_path: str,
+        dependencies: Optional[Sequence[params.Depends]],
+    ):
+        self._register_mcp_connection_endpoint_sse(router, transport, mount_path, dependencies)
+        self._register_mcp_messages_endpoint_sse(router, transport, mount_path, dependencies)
+
+    def _setup_auth_2025_03_26(self):
+        from fastapi_mcp.auth.proxy import (
+            setup_oauth_custom_metadata,
+            setup_oauth_metadata_proxy,
+            setup_oauth_authorize_proxy,
+            setup_oauth_fake_dynamic_register_endpoint,
+        )
+
+        if self._auth_config:
+            if self._auth_config.custom_oauth_metadata:
+                setup_oauth_custom_metadata(
+                    app=self.fastapi,
+                    auth_config=self._auth_config,
+                    metadata=self._auth_config.custom_oauth_metadata,
+                )
+
+            elif self._auth_config.setup_proxies:
+                assert self._auth_config.client_id is not None
+
+                metadata_url = self._auth_config.oauth_metadata_url
+                if not metadata_url:
+                    metadata_url = f"{self._auth_config.issuer}{self._auth_config.metadata_path}"
+
+                setup_oauth_metadata_proxy(
+                    app=self.fastapi,
+                    metadata_url=metadata_url,
+                    path=self._auth_config.metadata_path,
+                    register_path="/oauth/register" if self._auth_config.setup_fake_dynamic_registration else None,
+                )
+                setup_oauth_authorize_proxy(
+                    app=self.fastapi,
+                    client_id=self._auth_config.client_id,
+                    authorize_url=self._auth_config.authorize_url,
+                    audience=self._auth_config.audience,
+                )
+                if self._auth_config.setup_fake_dynamic_registration:
+                    assert self._auth_config.client_secret is not None
+                    setup_oauth_fake_dynamic_register_endpoint(
+                        app=self.fastapi,
+                        client_id=self._auth_config.client_id,
+                        client_secret=self._auth_config.client_secret,
+                    )
+
+    def _setup_auth(self):
+        if self._auth_config:
+            if self._auth_config.version == "2025-03-26":
+                self._setup_auth_2025_03_26()
+            else:
+                raise ValueError(
+                    f"Unsupported MCP spec version: {self._auth_config.version}. Please check your AuthConfig."
+                )
+        else:
+            logger.info("No auth config provided, skipping auth setup")
+
+    def mount(
+        self,
+        router: Annotated[
+            Optional[FastAPI | APIRouter],
+            Doc(
+                """
+                The FastAPI app or APIRouter to mount the MCP server to. If not provided, the MCP
+                server will be mounted to the FastAPI app.
+                """
+            ),
+        ] = None,
+        mount_path: Annotated[
+            str,
+            Doc(
+                """
+                Path where the MCP server will be mounted. Defaults to '/mcp'.
+                """
+            ),
+        ] = "/mcp",
+        transport: Annotated[
+            Literal["sse"],
+            Doc(
+                """
+                The transport type for the MCP server. Currently only 'sse' is supported.
+                """
+            ),
+        ] = "sse",
+    ) -> None:
         """
         Mount the MCP server to **any** FastAPI app or APIRouter.
+
         There is no requirement that the FastAPI app or APIRouter is the same as the one that the MCP
         server was created from.
-
-        Args:
-            router: The FastAPI app or APIRouter to mount the MCP server to. If not provided, the MCP
-                    server will be mounted to the FastAPI app.
-            mount_path: Path where the MCP server will be mounted
         """
         # Normalize mount path
         if not mount_path.startswith("/"):
@@ -171,20 +339,14 @@ class FastApiMCP:
 
         sse_transport = FastApiSseTransport(messages_path)
 
-        # Route for MCP connection
-        @router.get(mount_path, include_in_schema=False, operation_id="mcp_connection")
-        async def handle_mcp_connection(request: Request):
-            async with sse_transport.connect_sse(request.scope, request.receive, request._send) as (reader, writer):
-                await self.server.run(
-                    reader,
-                    writer,
-                    self.server.create_initialization_options(notification_options=None, experimental_capabilities={}),
-                )
+        dependencies = self._auth_config.dependencies if self._auth_config else None
 
-        # Route for MCP messages
-        @router.post(f"{mount_path}/messages/", include_in_schema=False, operation_id="mcp_messages")
-        async def handle_post_message(request: Request):
-            return await sse_transport.handle_fastapi_post_message(request)
+        if transport == "sse":
+            self._register_mcp_endpoints_sse(router, sse_transport, mount_path, dependencies)
+        else:  # pragma: no cover
+            raise ValueError(f"Invalid transport: {transport}")  # pragma: no cover
+
+        self._setup_auth()
 
         # HACK: If we got a router and not a FastAPI instance, we need to re-include the router so that
         # FastAPI will pick up the new routes we added. The problem with this approach is that we assume
@@ -198,21 +360,17 @@ class FastApiMCP:
 
     async def _execute_api_tool(
         self,
-        client: AsyncClientProtocol,
-        base_url: str,
-        tool_name: str,
-        arguments: Dict[str, Any],
-        operation_map: Dict[str, Dict[str, Any]],
+        client: Annotated[httpx.AsyncClient, Doc("httpx client to use in API calls")],
+        tool_name: Annotated[str, Doc("The name of the tool to execute")],
+        arguments: Annotated[Dict[str, Any], Doc("The arguments for the tool")],
+        operation_map: Annotated[Dict[str, Dict[str, Any]], Doc("A mapping from tool names to operation details")],
+        http_request_info: Annotated[
+            Optional[HTTPRequestInfo],
+            Doc("HTTP request info to forward to the actual API call"),
+        ] = None,
     ) -> List[Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
         """
         Execute an MCP tool by making an HTTP request to the corresponding API endpoint.
-
-        Args:
-            base_url: The base URL for the API
-            tool_name: The name of the tool to execute
-            arguments: The arguments for the tool
-            operation_map: A mapping from tool names to operation details
-            client: Optional HTTP client to use (primarily for testing)
 
         Returns:
             The result as MCP content types
@@ -226,13 +384,12 @@ class FastApiMCP:
         parameters: List[Dict[str, Any]] = operation.get("parameters", [])
         arguments = arguments.copy() if arguments else {}  # Deep copy arguments to avoid mutating the original
 
-        url = f"{base_url}{path}"
         for param in parameters:
             if param.get("in") == "path" and param.get("name") in arguments:
                 param_name = param.get("name", None)
                 if param_name is None:
                     raise ValueError(f"Parameter name is None for parameter: {param}")
-                url = url.replace(f"{{{param_name}}}", str(arguments.pop(param_name)))
+                path = path.replace(f"{{{param_name}}}", str(arguments.pop(param_name)))
 
         query = {}
         for param in parameters:
@@ -250,11 +407,17 @@ class FastApiMCP:
                     raise ValueError(f"Parameter name is None for parameter: {param}")
                 headers[param_name] = arguments.pop(param_name)
 
+        if http_request_info and http_request_info.headers:
+            if "Authorization" in http_request_info.headers:
+                headers["Authorization"] = http_request_info.headers["Authorization"]
+            elif "authorization" in http_request_info.headers:
+                headers["Authorization"] = http_request_info.headers["authorization"]
+
         body = arguments if arguments else None
 
         try:
-            logger.debug(f"Making {method.upper()} request to {url}")
-            response = await self._request(client, method, url, query, headers, body)
+            logger.debug(f"Making {method.upper()} request to {path}")
+            response = await self._request(client, method, path, query, headers, body)
 
             # TODO: Better typing for the AsyncClientProtocol. It should return a ResponseProtocol that has a json() method that returns a dict/list/etc.
             try:
@@ -284,24 +447,23 @@ class FastApiMCP:
 
     async def _request(
         self,
-        client: AsyncClientProtocol,
+        client: httpx.AsyncClient,
         method: str,
-        url: str,
+        path: str,
         query: Dict[str, Any],
         headers: Dict[str, str],
         body: Optional[Any],
     ) -> Any:
-        """Helper method to make the actual HTTP request"""
         if method.lower() == "get":
-            return await client.get(url, params=query, headers=headers)
+            return await client.get(path, params=query, headers=headers)
         elif method.lower() == "post":
-            return await client.post(url, params=query, headers=headers, json=body)
+            return await client.post(path, params=query, headers=headers, json=body)
         elif method.lower() == "put":
-            return await client.put(url, params=query, headers=headers, json=body)
+            return await client.put(path, params=query, headers=headers, json=body)
         elif method.lower() == "delete":
-            return await client.delete(url, params=query, headers=headers)
+            return await client.delete(path, params=query, headers=headers)
         elif method.lower() == "patch":
-            return await client.patch(url, params=query, headers=headers, json=body)
+            return await client.patch(path, params=query, headers=headers, json=body)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
 

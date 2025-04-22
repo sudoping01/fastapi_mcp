@@ -7,15 +7,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 
-# Create a simple FastAPI app
-app = FastAPI(
-    title="Example API",
-    description="A simple example API with integrated MCP server",
-    version="0.1.0",
-)
+app = FastAPI()
 
 
-# Define some models
 class Item(BaseModel):
     id: int
     name: str
@@ -24,11 +18,9 @@ class Item(BaseModel):
     tags: List[str] = []
 
 
-# In-memory database
 items_db: dict[int, Item] = {}
 
 
-# Define some endpoints
 @app.get("/items/", response_model=List[Item], tags=["items"], operation_id="list_items")
 async def list_items(skip: int = 0, limit: int = 10):
     """
@@ -105,27 +97,23 @@ async def search_items(
     """
     results = list(items_db.values())
 
-    # Filter by search query
     if q:
         q = q.lower()
         results = [
             item for item in results if q in item.name.lower() or (item.description and q in item.description.lower())
         ]
 
-    # Filter by price range
     if min_price is not None:
         results = [item for item in results if item.price >= min_price]
     if max_price is not None:
         results = [item for item in results if item.price <= max_price]
 
-    # Filter by tags
     if tags:
         results = [item for item in results if all(tag in item.tags for tag in tags)]
 
     return results
 
 
-# Add sample data
 sample_items = [
     Item(id=1, name="Hammer", description="A tool for hammering nails", price=9.99, tags=["tool", "hardware"]),
     Item(id=2, name="Screwdriver", description="A tool for driving screws", price=7.99, tags=["tool", "hardware"]),

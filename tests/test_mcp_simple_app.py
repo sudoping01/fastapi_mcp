@@ -7,21 +7,24 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from fastapi import FastAPI
 
 from fastapi_mcp import FastApiMCP
-from fastapi_mcp.utils.testing import FastAPITestClient
 
 from .fixtures.types import Item
 
 
 @pytest.fixture
-def lowlevel_server_simple_app(simple_fastapi_app: FastAPI) -> Server:
+def fastapi_mcp(simple_fastapi_app: FastAPI) -> FastApiMCP:
     mcp = FastApiMCP(
         simple_fastapi_app,
         name="Test MCP Server",
         description="Test description",
-        base_url="",
-        http_client=FastAPITestClient(simple_fastapi_app),
     )
-    return mcp.server
+    mcp.mount()
+    return mcp
+
+
+@pytest.fixture
+def lowlevel_server_simple_app(fastapi_mcp: FastApiMCP) -> Server:
+    return fastapi_mcp.server
 
 
 @pytest.mark.asyncio
@@ -231,3 +234,82 @@ async def test_call_tool_get_item_with_details(lowlevel_server_simple_app: Serve
         assert parsed_result.price == 10.0
         assert parsed_result.tags == ["tag1", "tag2"]
         assert parsed_result.description == "Item 1 description"
+
+
+@pytest.mark.asyncio
+async def test_headers_passthrough_to_tool_handler(fastapi_mcp: FastApiMCP):
+    """Test that the original request's headers pass through to the MCP tool call handler."""
+    from unittest.mock import patch, MagicMock
+    from fastapi_mcp.types import HTTPRequestInfo
+
+    # Test with uppercase "Authorization" header
+    with patch.object(fastapi_mcp, "_request") as mock_request:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = '{"result": "success"}'
+        mock_response.json.return_value = {"result": "success"}
+        mock_request.return_value = mock_response
+
+        http_request_info = HTTPRequestInfo(
+            method="POST",
+            path="/test",
+            headers={"Authorization": "Bearer token123"},
+            cookies={},
+            query_params={},
+            body=None,
+        )
+
+        try:
+            # Call the _execute_api_tool method directly
+            # We don't care if it succeeds, just that _request gets the right headers
+            await fastapi_mcp._execute_api_tool(
+                client=fastapi_mcp._http_client,
+                tool_name="get_item",
+                arguments={"item_id": 1},
+                operation_map=fastapi_mcp.operation_map,
+                http_request_info=http_request_info,
+            )
+        except Exception:
+            pass
+
+        assert mock_request.called, "The _request method was not called"
+
+        if mock_request.called:
+            headers_arg = mock_request.call_args[0][4]  # headers are the 5th argument
+            assert "Authorization" in headers_arg
+            assert headers_arg["Authorization"] == "Bearer token123"
+
+    # Test again with lowercase "authorization" header
+    with patch.object(fastapi_mcp, "_request") as mock_request:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = '{"result": "success"}'
+        mock_response.json.return_value = {"result": "success"}
+        mock_request.return_value = mock_response
+
+        http_request_info = HTTPRequestInfo(
+            method="POST",
+            path="/test",
+            headers={"authorization": "Bearer token456"},
+            cookies={},
+            query_params={},
+            body=None,
+        )
+
+        try:
+            await fastapi_mcp._execute_api_tool(
+                client=fastapi_mcp._http_client,
+                tool_name="get_item",
+                arguments={"item_id": 1},
+                operation_map=fastapi_mcp.operation_map,
+                http_request_info=http_request_info,
+            )
+        except Exception:
+            pass
+
+        assert mock_request.called, "The _request method was not called"
+
+        if mock_request.called:
+            headers_arg = mock_request.call_args[0][4]  # headers are the 5th argument
+            assert "Authorization" in headers_arg
+            assert headers_arg["Authorization"] == "Bearer token456"
